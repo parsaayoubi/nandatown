@@ -24,6 +24,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from nest_core.types import AgentId, Token
+
 
 class ValidationResult:
     """Result of a protocol validation check."""
@@ -4737,6 +4739,125 @@ def validate_sybil_bond_attempts_rejected(
             True,
             f"{len(bidders)} Sybils bid for a bond and were all rejected to the floor",
         )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Delegation (auth) validators
+# ---------------------------------------------------------------------------
+#
+# Adversarial checks for delegatable capability tokens. Like
+# ``validate_crdt_convergence`` above, these probe a plugin directly (not a
+# trace): each drives an ``Auth`` plugin through one of the attacks the
+# delegation problem calls out. The suite must FAIL against the default
+# ``jwt`` plugin (no delegation, no cascading revocation) and PASS against
+# ``delegatable``.
+
+
+async def _try_delegate(auth: Any, parent: Token, aud: str, scopes: list[str], ttl: float):
+    """Return (token, exc) — token if delegate succeeded, else the exception."""
+    delegate = getattr(auth, "delegate", None)
+    if delegate is None:
+        return None, None  # plugin has no delegation surface at all
+    try:
+        tok = await delegate(parent, AgentId(aud), scopes, ttl)
+        return tok, None
+    except Exception as exc:  # noqa: BLE001 - we are probing for a raise
+        return None, exc
+
+
+async def validate_delegation_scope_escalation(auth: Any) -> ValidationResult:
+    """A child may not hold scopes its parent lacks."""
+    root = await auth.issue(AgentId("root"), ["read"])
+    tok, exc = await _try_delegate(auth, root, "b", ["read", "admin"], 60.0)
+    if tok is None and exc is None:
+        return ValidationResult(
+            "scope_escalation",
+            False,
+            "plugin has no delegate(); cannot attenuate authority at all",
+        )
+    if exc is not None:
+        return ValidationResult("scope_escalation", True, f"correctly rejected: {exc}")
+    return ValidationResult(
+        "scope_escalation",
+        False,
+        "delegate() minted a child holding 'admin', which the parent never had",
+    )
+
+
+async def validate_delegation_cascading_revocation(auth: Any) -> ValidationResult:
+    """Revoking a parent must invalidate its children (cascading revocation)."""
+    root = await auth.issue(AgentId("root"), ["read", "write"])
+    child, exc = await _try_delegate(auth, root, "b", ["read"], 60.0)
+    if child is None:
+        return ValidationResult(
+            "stale_parent",
+            False,
+            f"could not delegate a child to test cascade: {exc}",
+        )
+    await auth.revoke(root)
+    try:
+        await auth.verify(child, presenter=AgentId("b"))
+    except TypeError:
+        # plugin's verify takes no presenter kwarg — retry positionally
+        try:
+            await auth.verify(child)
+        except Exception as exc2:  # noqa: BLE001
+            return ValidationResult(
+                "stale_parent", True, f"child rejected after parent revoked: {exc2}"
+            )
+        return ValidationResult(
+            "stale_parent", False, "child still verified after its parent was revoked"
+        )
+    except Exception as exc3:  # noqa: BLE001
+        return ValidationResult(
+            "stale_parent", True, f"child rejected after parent revoked: {exc3}"
+        )
+    return ValidationResult(
+        "stale_parent", False, "child still verified after its parent was revoked"
+    )
+
+
+async def validate_delegation_audience_binding(auth: Any) -> ValidationResult:
+    """A delegated token presented by the wrong agent must be rejected."""
+    root = await auth.issue(AgentId("root"), ["read"])
+    child, exc = await _try_delegate(auth, root, "b", ["read"], 60.0)
+    if child is None:
+        return ValidationResult(
+            "audience_confusion",
+            False,
+            f"could not delegate a child to test audience binding: {exc}",
+        )
+    try:
+        await auth.verify(child, presenter=AgentId("attacker-z"))
+    except TypeError:
+        return ValidationResult(
+            "audience_confusion",
+            False,
+            "verify() ignores who presents the token (no audience binding)",
+        )
+    except Exception as exc2:  # noqa: BLE001
+        return ValidationResult("audience_confusion", True, f"wrong presenter rejected: {exc2}")
+    return ValidationResult(
+        "audience_confusion",
+        False,
+        "token bound to 'b' was accepted when presented by 'attacker-z'",
+    )
+
+
+async def run_delegation_suite(auth: Any) -> list[ValidationResult]:
+    """Run all three adversarial delegation checks against an Auth plugin.
+
+    Example::
+
+        from nest_plugins_reference.auth.delegatable import DelegatableAuth
+        results = await run_delegation_suite(DelegatableAuth(secret=b"s"))
+        assert all(r.passed for r in results)
+    """
+    return [
+        await validate_delegation_scope_escalation(auth),
+        await validate_delegation_cascading_revocation(auth),
+        await validate_delegation_audience_binding(auth),
     ]
 
 
